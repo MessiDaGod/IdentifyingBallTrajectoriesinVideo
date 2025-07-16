@@ -9,7 +9,7 @@ import UIKit
 import AVFoundation
 import Vision
 
-class ViewController: UIViewController {
+class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
 
     @IBOutlet var previewView: PreviewView!
     // Properties for UI
@@ -31,6 +31,14 @@ class ViewController: UIViewController {
     
     override func viewDidLoad() {
         super.viewDidLoad()
+        
+        let uploadButton = UIButton(type: .system)
+        uploadButton.setTitle("Upload Video", for: .normal)
+        uploadButton.frame = CGRect(x: 20, y: 40, width: 150, height: 40)
+        uploadButton.addTarget(self, action: #selector(pickVideoFromLibrary), for: .touchUpInside)
+        view.addSubview(uploadButton)
+        
+        
         request = VNDetectTrajectoriesRequest(frameAnalysisSpacing: .zero, trajectoryLength: 10, completionHandler: completionHandler)
         
         previewView.videoPreviewLayer.session = captureSession
@@ -47,6 +55,105 @@ class ViewController: UIViewController {
             self.setupCamera()
         }
     }
+    
+    @objc func pickVideoFromLibrary() {
+        // Stop camera safely if it's running
+        captureSessionQueue.async {
+            if self.captureSession.isRunning {
+                self.captureSession.stopRunning()
+            }
+        }
+
+        let picker = UIImagePickerController()
+        picker.sourceType = .photoLibrary
+        picker.mediaTypes = ["public.movie"]
+        picker.delegate = self
+        DispatchQueue.main.async {
+            self.present(picker, animated: true)
+        }
+    }
+
+    func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) {
+        dismiss(animated: true)
+
+        guard let mediaURL = info[.mediaURL] as? URL else {
+            print("❌ Could not get mediaURL")
+            return
+        }
+
+        print("✅ Selected video URL: \(mediaURL)")
+
+        // If you want to process it with Vision:
+        processVideoAtURL(mediaURL)
+    }
+
+    func processVideoAtURL(_ url: URL) {
+        
+        let asset = AVAsset(url: url)
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            print("❌ Could not create AVAssetReader:", error)
+            return
+        }
+        let playerItem = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: playerItem)
+        let playerLayer = AVPlayerLayer(player: player)
+        playerLayer.frame = self.previewView.bounds
+        playerLayer.videoGravity = .resizeAspect
+        player.play()
+        
+        DispatchQueue.main.async {
+            self.previewView.layer.sublayers?.forEach { $0.removeFromSuperlayer() } // Clear old layers
+            self.previewView.layer.addSublayer(playerLayer)
+        }
+        
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            print("❌ No video track found")
+            return
+        }
+        
+        let readerOutputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ]
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerOutputSettings)
+        trackOutput.alwaysCopiesSampleData = false
+        reader.add(trackOutput)
+        
+        if !reader.startReading() {
+            print("❌ Failed to start reading")
+            return
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            while reader.status == .reading {
+                guard let sampleBuffer = trackOutput.copyNextSampleBuffer() else { break }
+                
+                let requestHandler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .right, options: [:])
+                
+                self.trajectoryQueue.async {
+                    if let rect = self.roiRect {
+                        self.request.regionOfInterest = rect
+                    } else {
+                        self.request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
+                    }
+                    
+                    do {
+                        try requestHandler.perform([self.request])
+                        DispatchQueue.main.async {
+                            self.drawTrajectories(self.trajectoryDictionary)
+                        }
+                    } catch {
+                        print("❌ Vision error:", error)
+                    }
+                }
+                
+                usleep(30_000) // Slow down processing to match video (~33 fps)
+            }
+        }
+    }
+
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
@@ -121,39 +228,57 @@ class ViewController: UIViewController {
     func setupCamera() {
         print("setupCamera")
         captureSession.beginConfiguration()
-        
-        //Configure video device input.
-        let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                  for: .video, position: .unspecified)
-        if let supportsSessionPreset = videoDevice?.supportsSessionPreset(.hd1920x1080), supportsSessionPreset == true {
+
+        // Get the camera device
+        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            print("⚠️ No camera device found")
+            return
+        }
+
+        // Set session preset based on device capabilities
+        if videoDevice.supportsSessionPreset(.hd1920x1080) {
             captureSession.sessionPreset = .hd1920x1080
         } else {
             captureSession.sessionPreset = .high
         }
-        
-        guard let videoDeviceInput = try? AVCaptureDeviceInput(device: videoDevice!), captureSession.canAddInput(videoDeviceInput) else { return }
-        captureSession.addInput(videoDeviceInput)
-        
-        // Configure video data output.
+
+        // Configure input
+        do {
+            let videoDeviceInput = try AVCaptureDeviceInput(device: videoDevice)
+            if captureSession.canAddInput(videoDeviceInput) {
+                captureSession.addInput(videoDeviceInput)
+            } else {
+                print("⚠️ Cannot add camera input")
+                return
+            }
+        } catch {
+            print("⚠️ Error creating AVCaptureDeviceInput:", error)
+            return
+        }
+
+        // Configure output
         if captureSession.canAddOutput(videoDataOutput) {
             captureSession.addOutput(videoDataOutput)
             videoDataOutput.alwaysDiscardsLateVideoFrames = true
             videoDataOutput.setSampleBufferDelegate(self, queue: videoDataOutputQueue)
-            videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
-            videoDataOutput.setSampleBufferDelegate(self, queue: videoDataOutputQueue)
+            videoDataOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            ]
         } else {
-            print("Could not add VDO output")
+            print("⚠️ Could not add video data output")
             return
         }
-        let captureConnection = videoDataOutput.connection(with: .video)
-        captureConnection?.preferredVideoStabilizationMode = .standard
-        captureConnection?.isEnabled = true
-        
+
+        if let captureConnection = videoDataOutput.connection(with: .video) {
+            captureConnection.preferredVideoStabilizationMode = .standard
+            captureConnection.isEnabled = true
+        }
+
         captureSession.commitConfiguration()
-        
         captureSession.startRunning()
-        print("Starting")
+        print("✅ Camera setup complete")
     }
+
 
     // MARK: - Vision handler
     func completionHandler(request: VNRequest, error: Error?) {
@@ -172,8 +297,10 @@ class ViewController: UIViewController {
         }
         
         guard let observations = request.results as? [VNTrajectoryObservation] else { return }
-        
+
+
         for observation in observations {
+            if observation.confidence < 0.9 { continue }
             print(observation.detectedPoints)
             print(observation.projectedPoints)
             print(observation)
@@ -216,38 +343,40 @@ class ViewController: UIViewController {
     func drawTrajectories(_ dict: [UUID: TrajectoryProperty]) {
         DispatchQueue.main.async {
             self.removeTrajectoryLayers()
-            if dict.count == 0 { return }
-            
+            if dict.isEmpty { return }
+
             let detectedPointPath = UIBezierPath()
             let projectedPointPath = UIBezierPath()
-            for trajectoryProperty in dict {
-                detectedPointPath.move(to: self.convertPointToUIViewCoordinates(normalizedPoint: trajectoryProperty.value.detectedPoints[0]))
-                for point in trajectoryProperty.value.detectedPoints {
-                    let convertedPoint = self.convertPointToUIViewCoordinates(normalizedPoint: point)
-                    detectedPointPath.addLine(to: convertedPoint)
+
+            for trajectoryProperty in dict.values {
+                let detectedPoints = trajectoryProperty.detectedPoints
+                let projectedPoints = trajectoryProperty.projectedPoints
+
+                guard !detectedPoints.isEmpty else { continue }
+                detectedPointPath.move(to: self.convertPointToUIViewCoordinates(normalizedPoint: detectedPoints[0]))
+                for point in detectedPoints {
+                    detectedPointPath.addLine(to: self.convertPointToUIViewCoordinates(normalizedPoint: point))
                 }
-                detectedPointPath.move(to: CGPoint())
-                
-                projectedPointPath.move(to: self.convertPointToUIViewCoordinates(normalizedPoint: trajectoryProperty.value.projectedPoints[0]))
-                for point in trajectoryProperty.value.projectedPoints {
-                    let convertedPoint = self.convertPointToUIViewCoordinates(normalizedPoint: point)
-                    projectedPointPath.addLine(to: convertedPoint)
+
+                if !projectedPoints.isEmpty {
+                    projectedPointPath.move(to: self.convertPointToUIViewCoordinates(normalizedPoint: projectedPoints[0]))
+                    for point in projectedPoints {
+                        projectedPointPath.addLine(to: self.convertPointToUIViewCoordinates(normalizedPoint: point))
+                    }
                 }
-                projectedPointPath.move(to: CGPoint())
             }
-            detectedPointPath.close()
-            projectedPointPath.close()
-            
+
             let detectedPointLayer = self.createCAShapeLayer(path: detectedPointPath.cgPath, strokeColor: UIColor.red.cgColor)
             self.trajectoryLayer.append(detectedPointLayer)
-            self.previewView.videoPreviewLayer.addSublayer(detectedPointLayer)
-            
+            self.previewView.layer.addSublayer(detectedPointLayer)
+
             let projectedPointLayer = self.createCAShapeLayer(path: projectedPointPath.cgPath, strokeColor: UIColor.green.cgColor)
             self.trajectoryLayer.append(projectedPointLayer)
-            self.previewView.videoPreviewLayer.addSublayer(projectedPointLayer)
+            self.previewView.layer.addSublayer(projectedPointLayer)
         }
     }
-    
+
+
     func createCAShapeLayer(path: CGPath, strokeColor: CGColor) -> CAShapeLayer {
         let layer = CAShapeLayer()
         layer.path = path
